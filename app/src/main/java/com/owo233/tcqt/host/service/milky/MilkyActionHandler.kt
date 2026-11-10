@@ -472,7 +472,7 @@ object MilkyActionHandler {
                 val input = decodeInput(KickGroupMemberInput.serializer(), bodyJson)
                 val uids = arrayListOf(GroupService.getUidFromUin(input.userId.toString()))
                 withTimeoutOrNull(8.seconds) {
-                    suspendCancellableCoroutine { cont ->
+                    suspendCancellableCoroutine<Unit> { cont ->
                         QQInterfaces.groupService.kickMember(
                             input.groupId,
                             uids,
@@ -760,7 +760,7 @@ object MilkyActionHandler {
         }
 
         val codeAndMsg = withTimeoutOrNull(10.seconds) {
-            suspendCancellableCoroutine { cont ->
+            suspendCancellableCoroutine<Pair<Int, String>> { cont ->
                 runCatching {
                     val iMsgService = QRoute.api(IMsgService::class.java)
                     iMsgService.sendMsgWithMsgId(contact.inner, msgId, elements) { result, errMsg ->
@@ -804,7 +804,7 @@ object MilkyActionHandler {
 
     private suspend fun resolveMsgIdFromSeq(contact: MapleContact.PublicContact, msgSeq: Long): Long? {
         return withTimeoutOrNull(5.seconds) {
-            suspendCancellableCoroutine { cont ->
+            suspendCancellableCoroutine<Long?> { cont ->
                 QQInterfaces.msgService.getSingleMsg(contact.inner, msgSeq) { _, _, list ->
                     if (cont.isActive) {
                         val rec = list?.firstOrNull()
@@ -836,7 +836,7 @@ object MilkyActionHandler {
         if (contact !is MapleContact.PublicContact) return null
 
         val record = withTimeoutOrNull(5.seconds) {
-            suspendCancellableCoroutine { cont ->
+            suspendCancellableCoroutine<MsgRecord?> { cont ->
                 QQInterfaces.msgService.getSingleMsg(contact.inner, msgSeq) { _, _, list ->
                     if (cont.isActive) {
                         val first = list?.firstOrNull()
@@ -1084,7 +1084,7 @@ object MilkyActionHandler {
 
     private suspend fun suspendOperate(block: (IOperateCallback) -> Unit) {
         val res = withTimeoutOrNull(8.seconds) {
-            suspendCancellableCoroutine { cont ->
+            suspendCancellableCoroutine<Pair<Int, String>> { cont ->
                 block(IOperateCallback { code, msg ->
                     if (cont.isActive) cont.resume(code to msg.orEmpty())
                 })
