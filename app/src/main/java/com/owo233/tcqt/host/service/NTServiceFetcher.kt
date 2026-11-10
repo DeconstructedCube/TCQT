@@ -4,6 +4,7 @@ import com.owo233.tcqt.core.config.TCQTSetting
 import com.owo233.tcqt.core.hook.MethodHookParam
 import com.owo233.tcqt.core.hook.hookMethodBefore
 import com.owo233.tcqt.core.log.LogUtils
+import com.owo233.tcqt.host.service.milky.MilkyEventDispatcher
 import com.tencent.qqnt.kernel.api.IKernelService
 import com.tencent.qqnt.kernel.nativeinterface.PushExtraInfo
 import mqq.app.MobileQQ
@@ -19,7 +20,7 @@ object NTServiceFetcher {
     fun onFetch(service: IKernelService) {
         this.iKernelService = service // initService钩子会被多次调用，允许它重新赋值
 
-        if (!TCQTSetting.getBoolean("msg_anti_recall")) return
+        if (!TCQTSetting.getBoolean("msg_anti_recall") && !TCQTSetting.getBoolean("milky_bot")) return
 
         val sessionClass = try {
             service.wrapperSession.javaClass
@@ -44,13 +45,14 @@ object NTServiceFetcher {
                 if (isRecallPushCommand(cmd) && observedPushCommands.add(cmd)) {
                     LogUtils.xposedNoFilter.i("AntiRecall push callback active: $cmd")
                 }
+                MilkyEventDispatcher.onMsfPush(cmd, buffer)
                 action(cmd, buffer, param)
             }
         }
 
         installHook(sessionClass, HookInstallationRegistry.Hook.BACKGROUND) {
             sessionClass.hookMethodBefore("switchToBackGround") {
-                if (TCQTSetting.getBoolean("msg_anti_recall")) it.result = null
+                if (TCQTSetting.getBoolean("msg_anti_recall") || TCQTSetting.getBoolean("milky_bot")) it.result = null
             }
         }
     }

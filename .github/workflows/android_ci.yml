@@ -66,7 +66,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          printf '%s' "$SIGN_KEYSTORE_BASE64" | base64 --decode > keystore.jks
+          if [ -n "${SIGN_KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$SIGN_KEYSTORE_BASE64" | base64 --decode > keystore.jks
+          else
+            unset KEYSTORE_PATH
+          fi
 
           chmod +x ./gradlew
 
