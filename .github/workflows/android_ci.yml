@@ -69,7 +69,10 @@ jobs:
           if [ -n "${SIGN_KEYSTORE_BASE64:-}" ]; then
             printf '%s' "$SIGN_KEYSTORE_BASE64" | base64 --decode > keystore.jks
           else
-            unset KEYSTORE_PATH
+            keytool -genkeypair -v -keystore keystore.jks -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -storepass android -keypass android -dname "CN=Android Debug,O=Android,C=US"
+            export KEYSTORE_PASSWORD=android
+            export KEY_ALIAS=androiddebugkey
+            export KEY_PASSWORD=android
           fi
 
           chmod +x ./gradlew
