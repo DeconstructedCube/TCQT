@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # Resolve the foreground user's browser, including for app-associated t.me links.
 case "$1" in
-    source) url='https://github.com/callng/TCQT' ;;
+    source) url='https://github.com/DeconstructedCube/TCQT' ;;
     channel) url='https://t.me/citcqt' ;;
     group) url='https://t.me/astcqt' ;;
     *) echo 'Unknown project link' >&2; exit 1 ;;

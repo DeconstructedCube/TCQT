@@ -1,5 +1,5 @@
 <resources>
-    <string name="xposed_name">TCQT</string>
-    <string name="xposed_desc">QQ(TIM)辅助增强模块 by callng@github</string>
+    <string name="xposed_name">TCQT-Milky</string>
+    <string name="xposed_desc">QQ(TIM)辅助增强模块 · Milky v1.3 分支（上游原作者 callng@github）</string>
     <string name="module_res_injection">query module resource injection</string>
 </resources>

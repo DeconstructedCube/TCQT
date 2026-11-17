@@ -1,6 +1,6 @@
 id=zygisk_tcqt
-name=Zygisk TCQT
+name=Zygisk TCQT-Milky
 version=@VERSION@
 versionCode=@VERSION_CODE@
-author=owo233
-description=TCQT — QQ/TIM 增强模块的 Zygisk 注入模式，无需 Xposed 框架。
+author=owo233 & DeconstructedCube
+description=TCQT-Milky — QQ/TIM 增强模块的 Zygisk 注入模式（集成 Milky v1.3 协议端），无需 Xposed 框架。

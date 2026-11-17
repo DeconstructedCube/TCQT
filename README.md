@@ -1,15 +1,15 @@
 <div align="center">
-    <h1> TCQT </h1>
+    <h1> TCQT-Milky </h1>
 
 [![GitHub release](https://img.shields.io/github/release/Xposed-Modules-Repo/com.owo233.tcqt.svg)](https://github.com/Xposed-Modules-Repo/com.owo233.tcqt/releases/latest)
-[![main](https://github.com/callng/TCQT/actions/workflows/android_ci.yml/badge.svg)](https://github.com/callng/TCQT/actions/workflows/android_ci.yml)
+[![main](https://github.com/DeconstructedCube/TCQT/actions/workflows/android_ci.yml/badge.svg)](https://github.com/DeconstructedCube/TCQT/actions/workflows/android_ci.yml)
 [![Telegram](https://img.shields.io/badge/Telegram-Chat-0088cc?logo=telegram)](https://telegram.me/astcqt)
 [![Telegram](https://img.shields.io/badge/Telegram-CI-0088cc?logo=telegram)](https://telegram.me/citcqt)
 [![Discord](https://img.shields.io/badge/Discord-%E5%8A%A0%E5%85%A5%E7%BE%A4%E7%BB%84-5865F2?logo=discord)](https://discord.gg/PjYenv5F9s)
 
 </div>
 
-> 支持 **LSPosed / Zygisk** 的 **QQ / TIM 消息防撤回多功能模块**
+> 基于 [callng/TCQT](https://github.com/callng/TCQT) 的 **Milky v1.3 协议端增强分支** —— 支持 **LSPosed / Zygisk** 的 **QQ / TIM 消息防撤回多功能模块**
 
 ---
 
@@ -122,7 +122,19 @@ DexKit 缓存分区、扫描及清空规则见 [DexKit 缓存说明](DEXKIT.md)�
 
 ---
 
+##  Milky v1.3 协议端
+
+本分支在保留上游全部功能的基础上，新增了宿主内嵌的 **Milky v1.3 协议端**（`MilkyBot`）：
+
+- 启用位置：宿主模块设置 → **高级** → **Milky 机器人协议端**（需重启宿主生效）
+- 通信协议：共用同一端口提供 HTTP API（`/api`）、WebSocket 事件流（`/event`）、SSE 事件流（`/event`）及多地址 WebHook 推送
+- 可配置项：监听地址 / 端口、Bearer `Access Token`、WebHook 推送地址、上报自身发送消息、强制仅监听本机回环（`127.0.0.1`）
+
+---
+
 ##  编译
+
+> 本分支主要通过 **GitHub Actions CI**（`.github/workflows/android_ci.yml`）自动编译构建；未配置签名 Secrets 时会自动生成临时调试签名用于测试。
 
 ### 环境要求
 
@@ -259,12 +271,13 @@ app/build/outputs/apk/release/  # 发布版本（TCQT-<版本>-release.apk，双
 
 ##  其他
 
-> 本模块已发布到 LSPosed 模块仓库，也可到本仓库下载实时构建(CI)版本。
+> 上游原版已发布到 LSPosed 模块仓库，本分支可通过 GitHub Actions CI 获取实时构建产物。
 
-| Type                | Source                                                                  |
-|---------------------|-------------------------------------------------------------------------|
-| LSPosed Module Repo | [TCQT](https://github.com/Xposed-Modules-Repo/com.owo233.tcqt/releases) |
-| Here                | [TCQT](https://github.com/callng/TCQT/actions/workflows/android_ci.yml) |
+| Type                | Source                                                                          |
+|---------------------|---------------------------------------------------------------------------------|
+| Fork CI             | [TCQT-Milky CI](https://github.com/DeconstructedCube/TCQT/actions/workflows/android_ci.yml) |
+| Upstream            | [callng/TCQT](https://github.com/callng/TCQT)                                   |
+| LSPosed Module Repo | [TCQT](https://github.com/Xposed-Modules-Repo/com.owo233.tcqt/releases)         |
 
 ### 额外说明
 

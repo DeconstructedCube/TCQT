@@ -17,7 +17,7 @@ updates:
       - "dependencies"
       - "android"
     reviewers:
-      - "callng"
+      - "DeconstructedCube"
 
   - package-ecosystem: "github-actions"
     directory: "/"

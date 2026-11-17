@@ -114,9 +114,9 @@ extensions.configure<ApplicationExtension> {
         }
 
         buildConfigField("String", "APP_NAME", "\"TCQT\"")
-        buildConfigField("String", "OPEN_ISSUES", "\"https://github.com/callng/TCQT/issues\"")
-        buildConfigField("String", "OPEN_SOURCE", "\"https://github.com/callng/TCQT\"")
-        buildConfigField("String", "OPEN_UPDATES", "\"https://github.com/callng/TCQT/actions/workflows/android_ci.yml\"")
+        buildConfigField("String", "OPEN_ISSUES", "\"https://github.com/DeconstructedCube/TCQT/issues\"")
+        buildConfigField("String", "OPEN_SOURCE", "\"https://github.com/DeconstructedCube/TCQT\"")
+        buildConfigField("String", "OPEN_UPDATES", "\"https://github.com/DeconstructedCube/TCQT/actions/workflows/android_ci.yml\"")
         buildConfigField("String", "TG_CHANNEL", "\"citcqt\"")
         buildConfigField("String", "TG_GROUP", "\"astcqt\"")
     }
