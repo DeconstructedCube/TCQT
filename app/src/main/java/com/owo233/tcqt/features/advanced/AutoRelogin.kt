@@ -1,17 +1,21 @@
 package com.owo233.tcqt.features.advanced
 
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Rect
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityNodeProvider
 import com.owo233.tcqt.annotations.RegisterAction
 import com.owo233.tcqt.api.Feature
@@ -28,6 +32,10 @@ import com.owo233.tcqt.core.log.Log
 import com.owo233.tcqt.core.reflect.callMethod
 import com.owo233.tcqt.core.reflect.callStaticMethod
 import com.owo233.tcqt.core.reflect.getObjectOrNull
+import com.owo233.tcqt.core.sync.ModuleScope
+import com.owo233.tcqt.core.sync.ReceiverRegistry
+import com.owo233.tcqt.host.service.SmsCodeBridge
+import com.owo233.tcqt.host.service.milky.MilkyServer
 import com.tencent.mobileqq.app.QBaseActivity
 import com.tencent.qphone.base.util.BaseApplication
 import com.tencent.qqnt.kernel.api.ILoginService
@@ -45,6 +53,8 @@ import mqq.app.AppRuntime
 import mqq.app.Constants
 import mqq.app.MobileQQ
 import java.lang.ref.WeakReference
+import kotlinx.coroutines.delay
+import org.json.JSONObject
 import java.lang.reflect.Method
 import java.lang.reflect.Proxy
 import java.security.MessageDigest
@@ -56,7 +66,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 object AutoRelogin : Feature(
     key = "auto_relogin",
     name = "自动重登",
-    desc = "被踢下线或会话过期时自动重新登录，支持自动点击人机验证无障碍按钮（等待约 25 秒通过）。",
+    desc = "被踢下线或会话过期时自动重新登录，支持自动点击人机验证无障碍按钮及短信接码辅助。",
     uiOrder = 16,
 ) {
 
@@ -64,12 +74,16 @@ object AutoRelogin : Feature(
     private const val FLAG_AUTO_CAPTCHA_ACCESSIBILITY = 0
     private const val FLAG_AUTO_DISMISS_KICK_DIALOG = 1
     private const val FLAG_AUTO_LOGIN_ON_LOGIN_PAGE = 2
+    private const val FLAG_AUTO_SMS_VERIFY = 3
 
     private const val KICK_DEBOUNCE_MS = 5_000L
     private const val CAPTCHA_CLICK_COOLDOWN_MS = 35_000L
     private const val CAPTCHA_POLL_INTERVAL_MS = 1_200L
     private const val CAPTCHA_WATCH_TIMEOUT_MS = 90_000L
     private const val MAX_RETRY_ATTEMPTS = 3
+    private const val CAPTCHA_GEOMETRY_DELAY_MS = 3_500L
+    private const val SMS_POLL_INTERVAL_MS = 2_000L
+    private const val SMS_POLL_TIMEOUT_MS = 120_000L
 
     private val KICK_LOGOUT_REASONS = setOf(
         "kicked",
@@ -102,11 +116,12 @@ object AutoRelogin : Feature(
     private val options by multiIntOption(
         settingKey = "options",
         name = "运行选项",
-        defaultValue = 3,
+        defaultValue = 11,
         options = listOf(
             "自动点击人机验证无障碍按钮",
             "自动关闭下线提示弹窗",
             "处于登录页时自动尝试登录",
+            "自动处理短信接码验证",
         ),
     )
 
@@ -119,6 +134,22 @@ object AutoRelogin : Feature(
         max = 30,
         step = 1,
         suffix = "秒",
+    )
+
+    private val smsFetchUrl by stringOption(
+        settingKey = "sms_fetch_url",
+        name = "短信取码接口 URL",
+        defaultValue = "",
+        desc = "可选：GET 请求取码接口（支持 {uin}、{phone} 占位符），留空则使用本机短信授权或 Milky 推送",
+        placeholder = "http://127.0.0.1:8080/sms?phone={phone}",
+    )
+
+    private val smsCodeRegex by stringOption(
+        settingKey = "sms_code_regex",
+        name = "短信验证码正则",
+        defaultValue = "(?<!\\d)(\\d{6})(?!\\d)",
+        desc = "从取码接口返回文本中提取验证码的正则表达式",
+        placeholder = "(?<!\\d)(\\d{6})(?!\\d)",
     )
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -147,17 +178,88 @@ object AutoRelogin : Feature(
         Collections.newSetFromMap(WeakHashMap<WebView, Boolean>())
     )
     private val lastCaptchaClickAt = Collections.synchronizedMap(WeakHashMap<WebView, Long>())
+    private val lastSmsActionAt = Collections.synchronizedMap(WeakHashMap<WebView, Long>())
+    private val smsPollingActive = Collections.synchronizedSet(
+        Collections.newSetFromMap(WeakHashMap<WebView, Boolean>())
+    )
+    private val smsBroadcastRegistered = AtomicBoolean(false)
+
+    private val getChildIdMethod: Method? by lazy {
+        runCatching {
+            AccessibilityNodeInfo::class.java.getMethod(
+                "getChildId",
+                Int::class.javaPrimitiveType,
+            ).apply { isAccessible = true }
+        }.getOrNull()
+    }
 
     override fun install() {
+        registerSmsBridgeReceiver()
         when (currentProcess) {
             ActionProcess.MAIN -> {
                 installKickAndReloginHooks()
-                installCaptchaAutoAccessibilityHook()
+                installVerifyWebViewHooks()
             }
             ActionProcess.TOOL -> {
-                installCaptchaAutoAccessibilityHook()
+                installVerifyWebViewHooks()
             }
             else -> Unit
+        }
+    }
+
+    private fun registerSmsBridgeReceiver() {
+        if (!smsBroadcastRegistered.compareAndSet(false, true)) return
+        val filter = IntentFilter().apply {
+            addAction(SmsCodeBridge.ACTION_SUBMIT_SMS_CODE)
+            if (currentProcess == ActionProcess.MAIN) {
+                addAction(SmsCodeBridge.ACTION_SMS_CHALLENGE)
+            }
+        }
+        ReceiverRegistry.register(
+            hostApp,
+            object : BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) {
+                    when (intent?.action) {
+                        SmsCodeBridge.ACTION_SUBMIT_SMS_CODE -> {
+                            val code = intent.getStringExtra(SmsCodeBridge.EXTRA_CODE).orEmpty()
+                            val ts = intent.getLongExtra(
+                                SmsCodeBridge.EXTRA_TIMESTAMP,
+                                System.currentTimeMillis(),
+                            )
+                            SmsCodeBridge.submitCode(null, code, timestampMs = ts, broadcast = false)
+                        }
+                        SmsCodeBridge.ACTION_SMS_CHALLENGE -> {
+                            val uin = intent.getStringExtra(SmsCodeBridge.EXTRA_UIN).orEmpty()
+                            val phone = intent.getStringExtra(SmsCodeBridge.EXTRA_PHONE).orEmpty()
+                            val ts = intent.getLongExtra(
+                                SmsCodeBridge.EXTRA_TIMESTAMP,
+                                System.currentTimeMillis(),
+                            )
+                            SmsCodeBridge.updateChallenge(null, uin, phone, ts, broadcast = false)
+                            notifyMilkySmsChallenge(uin, phone, ts)
+                        }
+                    }
+                }
+            },
+            filter,
+            exported = false,
+        )
+    }
+
+    private fun notifyMilkySmsChallenge(uin: String, maskedPhone: String, timestampMs: Long) {
+        if (currentProcess != ActionProcess.MAIN) return
+        runCatching {
+            val payload = JSONObject().apply {
+                put("event_type", "tcqt_sms_verify_required")
+                put("time", timestampMs / 1000L)
+                put("self_id", uin.toLongOrNull() ?: 0L)
+                put("data", JSONObject().apply {
+                    put("uin", uin)
+                    put("masked_phone", maskedPhone)
+                    put("timestamp", timestampMs)
+                })
+            }.toString()
+            MilkyServer.broadcastCustomJson(payload)
         }
     }
 
@@ -581,6 +683,7 @@ object AutoRelogin : Feature(
         suppressedLoginActivityHash = 0
         Log.i("$TAG: auto relogin succeeded for $uin")
         Toasts.success("自动重登成功: $uin")
+        SmsCodeBridge.clearChallenge()
     }
 
     private fun onReloginCancelled(activity: Activity?) {
@@ -612,7 +715,7 @@ object AutoRelogin : Feature(
         scheduleRelogin(delayMs = backoffMs, reason = "retry#$consecutiveFailures")
     }
 
-    private fun installCaptchaAutoAccessibilityHook() {
+    private fun installVerifyWebViewHooks() {
         runCatching {
             val pluginClass = load("com.tencent.mobileqq.vaswebviewplugin.MQPSecJsPlugin")
             val customWebViewClass = load("com.tencent.biz.pubaccount.CustomWebView")
@@ -620,12 +723,11 @@ object AutoRelogin : Feature(
                 pluginClass.declaredMethods.firstOrNull {
                     it.name == "onWebViewCreated" && it.parameterTypes.size == 1
                 }?.hookAfter { param ->
-                    if (!options.isFlagEnabled(FLAG_AUTO_CAPTCHA_ACCESSIBILITY)) return@hookAfter
                     val webView = param.args.getOrNull(0) as? WebView ?: return@hookAfter
                     val activity = param.thisObject?.getObjectOrNull("activity") as? Activity
                         ?: findActivity(asView(webView))
-                    if (isCaptchaContext(activity, webView.url)) {
-                        startCaptchaAccessibilityWatcher(webView, activity)
+                    if (isVerifyWebViewContext(activity, webView.url)) {
+                        startVerifyWebViewWatcher(webView, activity)
                     }
                 }
             }
@@ -639,14 +741,13 @@ object AutoRelogin : Feature(
                 WebView::class.java,
                 String::class.java,
             ) { param ->
-                if (!options.isFlagEnabled(FLAG_AUTO_CAPTCHA_ACCESSIBILITY)) return@hookMethodAfter
                 val webView = param.args.getOrNull(0) as? WebView ?: return@hookMethodAfter
                 val url = param.args.getOrNull(1) as? String ?: webView.url
                 if (url.isNullOrBlank() || url == "about:blank") return@hookMethodAfter
                 val activity = findActivity(asView(webView))
-                if (isCaptchaContext(activity, url)) {
-                    startCaptchaAccessibilityWatcher(webView, activity)
-                    tryClickCaptchaAccessibility(webView, url)
+                if (isVerifyWebViewContext(activity, url)) {
+                    startVerifyWebViewWatcher(webView, activity)
+                    tickVerifyWebView(webView, activity, url, elapsedMs = 0L)
                 }
             }
         }.onFailure {
@@ -654,7 +755,18 @@ object AutoRelogin : Feature(
         }
     }
 
-    private fun isCaptchaContext(activity: Activity?, url: String?): Boolean {
+    private fun isVerifyWebViewContext(activity: Activity?, url: String?): Boolean {
+        val intent = activity?.intent
+        if (intent != null && intent.hasExtra("web_bridge_seq")) return true
+        val u = url.orEmpty()
+        return u.contains("captcha", ignoreCase = true) ||
+            u.contains("turing", ignoreCase = true) ||
+            u.contains("aq.qq.com", ignoreCase = true) ||
+            u.contains("ti.qq.com", ignoreCase = true) ||
+            u.contains("accounts.qq.com", ignoreCase = true)
+    }
+
+    private fun isPuzzleCaptchaContext(activity: Activity?, url: String?): Boolean {
         val intent = activity?.intent
         if (intent != null && intent.hasExtra("web_bridge_seq")) {
             val business = intent.getLongExtra("business", 0L)
@@ -665,7 +777,7 @@ object AutoRelogin : Feature(
             u.contains("turing", ignoreCase = true)
     }
 
-    private fun startCaptchaAccessibilityWatcher(webView: WebView, activity: Activity?) {
+    private fun startVerifyWebViewWatcher(webView: WebView, activity: Activity?) {
         if (!watchedWebViews.add(webView)) return
         val startAt = SystemClock.elapsedRealtime()
         val actRef = WeakReference(activity)
@@ -679,13 +791,14 @@ object AutoRelogin : Feature(
                     watchedWebViews.remove(wv)
                     return
                 }
-                if (SystemClock.elapsedRealtime() - startAt > CAPTCHA_WATCH_TIMEOUT_MS) {
+                val elapsedMs = SystemClock.elapsedRealtime() - startAt
+                if (elapsedMs > CAPTCHA_WATCH_TIMEOUT_MS) {
                     watchedWebViews.remove(wv)
                     return
                 }
                 val view = asView(wv)
                 if (view != null && view.isAttachedToWindow) {
-                    tryClickCaptchaAccessibility(wv, wv.url)
+                    tickVerifyWebView(wv, act, wv.url, elapsedMs)
                 }
                 mainHandler.postDelayed(this, CAPTCHA_POLL_INTERVAL_MS)
             }
@@ -693,32 +806,84 @@ object AutoRelogin : Feature(
         mainHandler.postDelayed(pollTask, CAPTCHA_POLL_INTERVAL_MS)
     }
 
-    private fun tryClickCaptchaAccessibility(webView: WebView, url: String?) {
+    private fun tickVerifyWebView(
+        webView: WebView,
+        activity: Activity?,
+        url: String?,
+        elapsedMs: Long,
+    ) {
+        if (options.isFlagEnabled(FLAG_AUTO_CAPTCHA_ACCESSIBILITY) && isPuzzleCaptchaContext(activity, url)) {
+            tryClickCaptchaAccessibility(webView, activity, url, elapsedMs)
+        }
+        if (options.isFlagEnabled(FLAG_AUTO_SMS_VERIFY)) {
+            inspectSmsVerifyPage(webView, activity)
+        }
+    }
+
+    private fun tryClickCaptchaAccessibility(
+        webView: WebView,
+        activity: Activity?,
+        url: String?,
+        elapsedMs: Long,
+    ) {
         val now = SystemClock.elapsedRealtime()
         val lastClick = lastCaptchaClickAt[webView] ?: 0L
         if (now - lastClick < CAPTCHA_CLICK_COOLDOWN_MS) return
 
         val view = asView(webView) ?: return
-        if (tryClickViaAccessibilityTree(view)) {
-            lastCaptchaClickAt[webView] = now
-            Log.i("$TAG: clicked captcha accessibility node via AccessibilityNodeProvider (url=$url)")
-            Toasts.info("已点击无障碍验证，等待约 25 秒自动通过")
-            return
+        when (tryClickViaAccessibilityTree(view)) {
+            A11yTreeResult.CLICKED -> {
+                lastCaptchaClickAt[webView] = now
+                Log.i("$TAG: clicked dialogSimpleBtn/a11y via AccessibilityNodeProvider (url=$url)")
+                Toasts.info("已点击无障碍验证，等待约 25 秒自动通过")
+                return
+            }
+            A11yTreeResult.ALREADY_IN_A11Y -> {
+                lastCaptchaClickAt[webView] = now
+                return
+            }
+            A11yTreeResult.NOT_FOUND -> Unit
         }
 
-        // Fallback for top-level / same-origin DOM before accessibility tree populates.
         webView.evaluateJavascript(CAPTCHA_ACCESSIBILITY_JS) { result ->
-            if (result != null && result.contains("clicked")) {
+            val r = result.orEmpty()
+            if (r.contains("already_a11y")) {
+                lastCaptchaClickAt[webView] = SystemClock.elapsedRealtime()
+                return@evaluateJavascript
+            }
+            if (r.contains("clicked")) {
                 lastCaptchaClickAt[webView] = SystemClock.elapsedRealtime()
                 Log.i("$TAG: clicked captcha accessibility button via JS (url=$url)")
                 Toasts.info("已点击无障碍验证，等待约 25 秒自动通过")
+                return@evaluateJavascript
+            }
+            val isPuzzleIntent = activity?.intent?.getLongExtra("business", 0L) == 2_097_152L
+            if (isPuzzleIntent &&
+                elapsedMs >= CAPTCHA_GEOMETRY_DELAY_MS &&
+                view.width > 0 &&
+                view.height > 0 &&
+                SystemClock.elapsedRealtime() - (lastCaptchaClickAt[webView] ?: 0L) >= CAPTCHA_CLICK_COOLDOWN_MS
+            ) {
+                val density = view.resources.displayMetrics.density
+                val tapX = (view.width - 91f * density).coerceIn(1f, view.width - 1f)
+                val tapY = (23f * density).coerceIn(1f, view.height - 1f)
+                lastCaptchaClickAt[webView] = SystemClock.elapsedRealtime()
+                dispatchTap(view, tapX, tapY)
+                Log.i("$TAG: tapped tcaptcha_iframe header accessibility fallback ($tapX, $tapY)")
+                Toasts.info("已触发无障碍验证，等待约 25 秒自动通过")
             }
         }
     }
 
+    private enum class A11yTreeResult {
+        CLICKED,
+        ALREADY_IN_A11Y,
+        NOT_FOUND,
+    }
+
     private fun asView(webView: WebView): View? = (webView as Any) as? View
 
-    private fun tryClickViaAccessibilityTree(rootView: View): Boolean {
+    private fun tryClickViaAccessibilityTree(rootView: View): A11yTreeResult {
         val queue = ArrayDeque<View>()
         queue.addLast(rootView)
         val rect = Rect()
@@ -728,27 +893,33 @@ object AutoRelogin : Feature(
             val current = queue.removeFirst()
             val provider: AccessibilityNodeProvider? = current.accessibilityNodeProvider
             if (provider != null) {
-                val nodes = runCatching {
-                    provider.findAccessibilityNodeInfosByText(
-                        "无障碍",
-                        AccessibilityNodeProvider.HOST_VIEW_ID,
-                    )
-                }.getOrNull().orEmpty()
+                val nodes = collectAccessibilityNodes(provider)
                 if (nodes.isNotEmpty()) {
+                    for (node in nodes) {
+                        val text = node.text?.toString().orEmpty()
+                        val desc = node.contentDescription?.toString().orEmpty()
+                        if (desc.contains("常规挑战") || text.contains("已为你切换到无障碍模式")) {
+                            return A11yTreeResult.ALREADY_IN_A11Y
+                        }
+                    }
                     current.getLocationOnScreen(loc)
                     for (node in nodes) {
                         val text = node.text?.toString().orEmpty()
                         val desc = node.contentDescription?.toString().orEmpty()
-                        if (!text.contains("无障碍") && !desc.contains("无障碍")) continue
+                        val viewId = node.viewIdResourceName.orEmpty()
+                        val matched = viewId == "dialogSimpleBtn" ||
+                            desc.contains("无障碍") ||
+                            text.contains("无障碍")
+                        if (!matched) continue
+
                         node.getBoundsInScreen(rect)
                         if (rect.isEmpty || rect.width() <= 0 || rect.height() <= 0) continue
-
                         val localX = (rect.centerX() - loc[0]).toFloat()
                         val localY = (rect.centerY() - loc[1]).toFloat()
                         if (localX < 0f || localY < 0f || localX > current.width || localY > current.height) continue
 
                         dispatchTap(current, localX, localY)
-                        return true
+                        return A11yTreeResult.CLICKED
                     }
                 }
             }
@@ -758,7 +929,160 @@ object AutoRelogin : Feature(
                 }
             }
         }
-        return false
+        return A11yTreeResult.NOT_FOUND
+    }
+
+    private fun collectAccessibilityNodes(provider: AccessibilityNodeProvider): List<AccessibilityNodeInfo> {
+        val collected = ArrayList<AccessibilityNodeInfo>()
+        val childMethod = getChildIdMethod
+        if (childMethod != null) {
+            val visited = HashSet<Int>()
+            val idQueue = ArrayDeque<Int>()
+            idQueue.addLast(AccessibilityNodeProvider.HOST_VIEW_ID)
+            while (idQueue.isNotEmpty() && collected.size < 300) {
+                val vid = idQueue.removeFirst()
+                if (!visited.add(vid)) continue
+                val node = runCatching { provider.createAccessibilityNodeInfo(vid) }.getOrNull() ?: continue
+                collected.add(node)
+                val count = node.childCount
+                for (i in 0 until count) {
+                    val childId = runCatching { childMethod.invoke(node, i) as? Long }.getOrNull() ?: continue
+                    val childVid = (childId shr 32).toInt()
+                    if (childVid !in visited) {
+                        idQueue.addLast(childVid)
+                    }
+                }
+            }
+        }
+        if (collected.isEmpty()) {
+            runCatching {
+                provider.findAccessibilityNodeInfosByText("无障碍", AccessibilityNodeProvider.HOST_VIEW_ID)
+            }.getOrNull()?.let { collected.addAll(it) }
+        }
+        return collected
+    }
+
+    private fun inspectSmsVerifyPage(webView: WebView, activity: Activity?) {
+        webView.evaluateJavascript(SMS_PAGE_INSPECT_JS) { raw ->
+            val cleaned = unquoteJsResult(raw) ?: return@evaluateJavascript
+            val json = runCatching { JSONObject(cleaned) }.getOrNull() ?: return@evaluateJavascript
+            val state = json.optString("state", "")
+            val phone = json.optString("phone", "")
+            val nowElapsed = SystemClock.elapsedRealtime()
+            val uin = resolveTargetUin()
+
+            when (state) {
+                "send_ready" -> {
+                    val lastAction = lastSmsActionAt[webView] ?: 0L
+                    if (nowElapsed - lastAction < 30_000L) return@evaluateJavascript
+                    lastSmsActionAt[webView] = nowElapsed
+                    val nowMs = System.currentTimeMillis()
+                    SmsCodeBridge.updateChallenge(hostApp, uin, phone, nowMs, broadcast = true)
+                    if (currentProcess == ActionProcess.MAIN) {
+                        notifyMilkySmsChallenge(uin, phone, nowMs)
+                    }
+                    webView.evaluateJavascript(SMS_CLICK_SEND_JS) {
+                        Log.i("$TAG: auto-clicked send SMS verification button (phone=$phone)")
+                        Toasts.info("已自动发送短信验证码，等待接收...")
+                    }
+                    startSmsCodePolling(webView, activity, uin, phone, sinceMs = nowMs - 5_000L)
+                }
+                "input_ready" -> {
+                    val challenge = SmsCodeBridge.pendingChallenge
+                    val sinceMs = if (challenge != null && (System.currentTimeMillis() - challenge.timestampMs) < 180_000L) {
+                        challenge.timestampMs - 5_000L
+                    } else {
+                        val nowMs = System.currentTimeMillis()
+                        SmsCodeBridge.updateChallenge(hostApp, uin, phone, nowMs, broadcast = true)
+                        if (currentProcess == ActionProcess.MAIN) {
+                            notifyMilkySmsChallenge(uin, phone, nowMs)
+                        }
+                        nowMs - 120_000L
+                    }
+                    startSmsCodePolling(webView, activity, uin, phone, sinceMs = sinceMs)
+                }
+            }
+        }
+    }
+
+    private fun startSmsCodePolling(
+        webView: WebView,
+        activity: Activity?,
+        uin: String,
+        maskedPhone: String,
+        sinceMs: Long,
+    ) {
+        if (!smsPollingActive.add(webView)) return
+        val wvRef = WeakReference(webView)
+        val actRef = WeakReference(activity)
+        val fetchUrl = smsFetchUrl
+        val codeRegex = smsCodeRegex
+        val startElapsed = SystemClock.elapsedRealtime()
+
+        ModuleScope.launchIO("$TAG-SmsPoll") {
+            try {
+                while (SystemClock.elapsedRealtime() - startElapsed < SMS_POLL_TIMEOUT_MS) {
+                    val act = actRef.get()
+                    val wv = wvRef.get() ?: break
+                    if (act != null && (act.isFinishing || act.isDestroyed)) break
+
+                    val code = SmsCodeBridge.consumeSubmittedCode(sinceMs)
+                        ?: SmsCodeBridge.queryLocalProvider(hostApp, sinceMs)
+                        ?: SmsCodeBridge.fetchFromHttpUrl(fetchUrl, codeRegex, uin, maskedPhone)
+
+                    if (!code.isNullOrBlank()) {
+                        Log.i("$TAG: obtained SMS code (len=${code.length}), filling into WebView")
+                        ModuleScope.onMain {
+                            fillSmsCodeIntoWebView(wv, code)
+                        }
+                        break
+                    }
+                    delay(SMS_POLL_INTERVAL_MS)
+                }
+            } finally {
+                smsPollingActive.remove(webView)
+            }
+        }
+    }
+
+    private fun fillSmsCodeIntoWebView(webView: WebView, code: String) {
+        Toasts.info("已获取验证码，正在自动填写")
+        webView.evaluateJavascript(buildFillSmsJs(code)) {
+            mainHandler.postDelayed({
+                webView.evaluateJavascript(SMS_PAGE_INSPECT_JS) { raw ->
+                    val cleaned = unquoteJsResult(raw).orEmpty()
+                    if (cleaned.contains("input_ready")) {
+                        val view = asView(webView) ?: return@evaluateJavascript
+                        webView.evaluateJavascript(SMS_FOCUS_INPUT_JS) {
+                            dispatchDigitKeys(view, code)
+                        }
+                    }
+                }
+            }, 1_200L)
+        }
+    }
+
+    private fun dispatchDigitKeys(target: View, code: String) {
+        target.requestFocus()
+        var delayMs = 80L
+        for (ch in code) {
+            if (ch !in '0'..'9') continue
+            val keyCode = KeyEvent.KEYCODE_0 + (ch - '0')
+            mainHandler.postDelayed({
+                val now = SystemClock.uptimeMillis()
+                target.dispatchKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0))
+                target.dispatchKeyEvent(KeyEvent(now, now + 20L, KeyEvent.ACTION_UP, keyCode, 0))
+            }, delayMs)
+            delayMs += 60L
+        }
+    }
+
+    private fun unquoteJsResult(raw: String?): String? {
+        if (raw.isNullOrBlank() || raw == "null") return null
+        if (raw.startsWith("\"") && raw.endsWith("\"") && raw.length >= 2) {
+            return runCatching { JSONObject("{\"v\":$raw}").getString("v") }.getOrNull()
+        }
+        return raw
     }
 
     private fun dispatchTap(target: View, x: Float, y: Float) {
@@ -798,12 +1122,24 @@ object AutoRelogin : Feature(
 
     private const val CAPTCHA_ACCESSIBILITY_JS = """
         (function() {
+            var bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
+            if (bodyText.indexOf('已为你切换到无障碍模式') !== -1) {
+                return 'already_a11y';
+            }
             var now = Date.now();
             if (window.__tcqtA11yClickedAt && (now - window.__tcqtA11yClickedAt) < 35000) {
                 return 'cooldown';
             }
             function scanDoc(doc) {
                 if (!doc) return false;
+                var direct = doc.getElementById('dialogSimpleBtn');
+                if (direct) {
+                    var directLabel = (direct.getAttribute('aria-label') || direct.innerText || '').trim();
+                    if (directLabel.indexOf('常规挑战') !== -1) return 'already_a11y';
+                    window.__tcqtA11yClickedAt = now;
+                    direct.click();
+                    return 'clicked';
+                }
                 var candidates = doc.querySelectorAll('button, a, [role="button"], div, span');
                 for (var i = 0; i < candidates.length; i++) {
                     var el = candidates[i];
@@ -815,17 +1151,82 @@ object AutoRelogin : Feature(
                     if (rect.width <= 0 || rect.height <= 0) continue;
                     window.__tcqtA11yClickedAt = now;
                     el.click();
-                    return true;
+                    return 'clicked';
                 }
                 var frames = doc.querySelectorAll('iframe');
                 for (var j = 0; j < frames.length; j++) {
                     try {
-                        if (scanDoc(frames[j].contentDocument)) return true;
+                        var res = scanDoc(frames[j].contentDocument);
+                        if (res) return res;
                     } catch (e) {}
                 }
                 return false;
             }
-            return scanDoc(document) ? 'clicked' : 'not_found';
+            return scanDoc(document) || 'not_found';
         })();
     """
+
+    private const val SMS_PAGE_INSPECT_JS = """
+        (function() {
+            var text = (document.body && document.body.innerText) ? document.body.innerText : '';
+            var phoneMatch = text.match(/1\d{2}\*{3,}\d{2}/);
+            var phone = phoneMatch ? phoneMatch[0] : '';
+            if (text.indexOf('输入短信验证码') !== -1) {
+                return JSON.stringify({ state: 'input_ready', phone: phone });
+            }
+            var btns = document.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+                if ((btns[i].innerText || '').indexOf('发送短信验证码') !== -1) {
+                    return JSON.stringify({ state: 'send_ready', phone: phone });
+                }
+            }
+            return JSON.stringify({ state: 'none', phone: phone });
+        })();
+    """
+
+    private const val SMS_CLICK_SEND_JS = """
+        (function() {
+            var btns = document.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+                if ((btns[i].innerText || '').indexOf('发送短信验证码') !== -1) {
+                    btns[i].click();
+                    return true;
+                }
+            }
+            return false;
+        })();
+    """
+
+    private const val SMS_FOCUS_INPUT_JS = """
+        (function() {
+            var input = document.querySelector('input');
+            if (input) {
+                input.focus();
+                input.click();
+                return true;
+            }
+            return false;
+        })();
+    """
+
+    private fun buildFillSmsJs(code: String): String {
+        val safe = JSONObject.quote(code)
+        return """
+            (function() {
+                var code = $safe;
+                var input = document.querySelector('input');
+                if (!input) return false;
+                input.focus();
+                var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                if (setter && setter.set) {
+                    setter.set.call(input, code);
+                } else {
+                    input.value = code;
+                }
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            })();
+        """.trimIndent()
+    }
 }

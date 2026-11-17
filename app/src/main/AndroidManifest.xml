@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
+    <uses-permission android:name="android.permission.READ_SMS" />
+    <uses-feature
+        android:name="android.hardware.telephony"
+        android:required="false" />
     <application
         android:description="@string/xposed_desc"
         android:icon="@mipmap/ic_launcher"
@@ -18,6 +23,12 @@
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />
+
+        <provider
+            android:name="com.owo233.tcqt.core.sms.SmsInboxProvider"
+            android:authorities="com.owo233.tcqt.sms"
+            android:exported="true"
+            tools:ignore="ExportedContentProvider" />
     </application>
 
 </manifest>

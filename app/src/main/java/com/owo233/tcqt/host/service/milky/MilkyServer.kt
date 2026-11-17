@@ -1,9 +1,11 @@
 package com.owo233.tcqt.host.service.milky
 
 import android.util.Base64
+import com.owo233.tcqt.core.env.HookEnv
 import com.owo233.tcqt.core.log.LogUtils
 import com.owo233.tcqt.core.sync.ModuleScope
 import com.owo233.tcqt.host.QQInterfaces
+import com.owo233.tcqt.host.service.SmsCodeBridge
 import com.owo233.tcqt.host.service.milky.model.ApiGeneralResponse
 import com.owo233.tcqt.host.service.milky.model.Event
 import com.owo233.tcqt.host.service.milky.model.milkyJsonModule
@@ -15,6 +17,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
@@ -106,7 +109,14 @@ object MilkyServer {
         }.onFailure {
             LogUtils.xposedNoFilter.e("MilkyServer failed to encode event", it)
         }.getOrNull() ?: return
+        broadcastRawJson(json)
+    }
 
+    fun broadcastCustomJson(json: String) {
+        broadcastRawJson(json)
+    }
+
+    private fun broadcastRawJson(json: String) {
         if (wsClients.isNotEmpty()) {
             val frame = encodeWsFrame(opcode = 0x1, payload = json.toByteArray(Charsets.UTF_8))
             for (ws in wsClients) {
@@ -221,6 +231,12 @@ object MilkyServer {
                 return
             }
 
+            if (method == "GET" && path == "/api/sms_verify_state") {
+                writeHttpResponse(output, 200, "OK", buildSmsVerifyStateResponse())
+                socket.close()
+                return
+            }
+
             if (method == "POST" && path.startsWith("/api/")) {
                 val contentType = headers["content-type"]?.lowercase().orEmpty()
                 if (!contentType.contains("application/json")) {
@@ -243,6 +259,33 @@ object MilkyServer {
                 }
                 val bodyStr = String(bodyBytes, 0, readTotal, Charsets.UTF_8).ifBlank { "{}" }
                 val action = path.removePrefix("/api/").trim('/')
+                if (action == "get_sms_verify_state") {
+                    writeHttpResponse(output, 200, "OK", buildSmsVerifyStateResponse())
+                    socket.close()
+                    return
+                }
+
+                if (action == "submit_sms_code") {
+                    val rawCode = runCatching { JSONObject(bodyStr).optString("code", "") }.getOrDefault("")
+                    val ctx = runCatching { HookEnv.application }.getOrNull()
+                    val accepted = SmsCodeBridge.submitCode(ctx, rawCode, broadcast = true)
+                    val resp = if (accepted != null) {
+                        JSONObject().apply {
+                            put("status", "ok")
+                            put("retcode", 0)
+                            put("data", JSONObject().apply {
+                                put("accepted", true)
+                                put("code", accepted)
+                            })
+                        }.toString()
+                    } else {
+                        """{"status":"failed","retcode":-400,"message":"Invalid SMS code"}"""
+                    }
+                    writeHttpResponse(output, 200, "OK", resp)
+                    socket.close()
+                    return
+                }
+
 
                 if (!MilkyActionHandler.isKnownAction(action)) {
                     writeHttpResponse(
@@ -284,6 +327,23 @@ object MilkyServer {
         } catch (_: Throwable) {
             runCatching { socket.close() }
         }
+    }
+
+    private fun buildSmsVerifyStateResponse(): String {
+        val challenge = SmsCodeBridge.pendingChallenge
+        val data = JSONObject().apply {
+            put("pending", challenge != null)
+            if (challenge != null) {
+                put("uin", challenge.uin)
+                put("masked_phone", challenge.maskedPhone)
+                put("timestamp", challenge.timestampMs)
+            }
+        }
+        return JSONObject().apply {
+            put("status", "ok")
+            put("retcode", 0)
+            put("data", data)
+        }.toString()
     }
 
     private fun checkAuth(headers: Map<String, String>, query: String): Boolean {
